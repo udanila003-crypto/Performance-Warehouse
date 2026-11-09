@@ -4,11 +4,15 @@ import { KeyboardAvoidingView, Modal, Pressable, StyleSheet, Text, TextInput, Vi
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Button, colors } from './ui';
 import { scanSound } from '../lib/beep';
+import { hwScanner, useHardwareScan } from '../lib/hwScanner';
+import { ScanDeduper, cleanScan, type ScanSource } from '../core/scanInput';
 
 /**
  * Сканер: камера телефона (QR, EAN-13/8, Code128/39, DataMatrix, UPC)
- * + поле ручного ввода. Поле ввода в фокусе также принимает данные
- * от аппаратного сканера ТСД, работающего в режиме эмуляции клавиатуры.
+ * + поле ручного ввода + встроенный сканер ТСД (Meferi ME61 и др.):
+ *  - режим Broadcast (рекомендуется) — коды приходят через modules/hw-scanner, фокус не нужен;
+ *  - режим эмуляции клавиатуры — коды попадают в поле ввода (оно в фокусе).
+ * На ТСД камера по умолчанию выключена — сканируют боковой кнопкой, камеру можно включить.
  */
 /** Результат обработки скана с цветом: red — меньше задания, green — сошлось, yellow — больше. */
 export interface ScanFeedback {
@@ -41,7 +45,12 @@ export function Scanner({
   const [manual, setManual] = useState('');
   const [message, setMessage] = useState<ScanFeedback | null>(null);
   const inputRef = useRef<TextInput>(null);
-  const lock = useRef(false);
+  /** Сканы обрабатываются строго по очереди — быстрые сканы ТСД подряд не теряются. */
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const dedup = useRef(new ScanDeduper());
+  const [useCamera, setUseCamera] = useState(!hwScanner.isTerminal);
+  /** Экранная клавиатура на ТСД: по умолчанию скрыта, чтобы не закрывать экран при сканах «клавиатурой». */
+  const [softKb, setSoftKb] = useState(!hwScanner.isTerminal);
   /** Последний код, который видит камера (наведение); засчитывается только по кнопке «СКАН». */
   const seen = useRef<{ code: string; at: number } | null>(null);
   const [inView, setInView] = useState<string | null>(null);
@@ -51,7 +60,7 @@ export function Scanner({
     if (visible) {
       setManual('');
       setMessage(null);
-      lock.current = false;
+      dedup.current.reset();
       seen.current = null;
       setInView(null);
       scanSound.ready().then(() => setSound(scanSound.enabled)).catch(() => undefined);
@@ -90,14 +99,22 @@ export function Scanner({
 
   const canAsk = !!perm && !perm.granted && perm.canAskAgain;
   useEffect(() => {
-    if (visible && canAsk) requestPerm();
-  }, [visible, canAsk, requestPerm]);
+    if (visible && useCamera && canAsk) requestPerm();
+  }, [visible, useCamera, canAsk, requestPerm]);
 
-  /** camera — по кнопке «СКАН»; input — сканер ТСД / ручной ввод. Каждый скан учитывается, даже одинаковый ШК подряд. */
-  async function handle(code: string, source: 'camera' | 'input') {
-    const c = code.trim();
-    if (!c || lock.current) return;
-    lock.current = true;
+  useHardwareScan(visible, (code) => handle(code, 'hardware'));
+
+  /**
+   * camera — по кнопке «СКАН»; hardware — кнопка сканера ТСД (Broadcast);
+   * input — сканер ТСД в режиме клавиатуры / ручной ввод. Каждый скан учитывается, даже одинаковый ШК подряд.
+   */
+  function handle(code: string, source: ScanSource) {
+    const c = cleanScan(code);
+    if (!c || !dedup.current.accept(c, source)) return;
+    queue.current = queue.current.then(() => process(c, source));
+  }
+
+  async function process(c: string, source: ScanSource) {
     try {
       const res = await onScan(c);
       if (typeof res === 'object') setMessage(res);
@@ -108,8 +125,7 @@ export function Scanner({
       scanSound.play('error');
       setMessage({ ok: false, tone: 'red', text: e instanceof Error ? e.message : String(e) });
     } finally {
-      lock.current = false;
-      if (source === 'input') setTimeout(() => inputRef.current?.focus(), 50);
+      if (source !== 'camera') setTimeout(() => inputRef.current?.focus(), 50);
     }
   }
 
@@ -121,6 +137,9 @@ export function Scanner({
         <View style={st.header}>
           <Text style={st.title}>{title}</Text>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 18 }}>
+            <Pressable hitSlop={12} onPress={() => setUseCamera((v) => !v)}>
+              <Text style={{ fontSize: 22, opacity: useCamera ? 1 : 0.5 }}>📷</Text>
+            </Pressable>
             <Pressable hitSlop={12} onPress={() => {
               const v = !sound;
               setSound(v);
@@ -135,7 +154,18 @@ export function Scanner({
           </View>
         </View>
         <View style={{ flex: 1 }}>
-          {perm?.granted ? (
+          {!useCamera ? (
+            <View style={st.center}>
+              <Text style={{ color: '#fff', textAlign: 'center', fontSize: 20, fontWeight: '700', marginBottom: 10 }}>
+                Сканируйте кнопкой ТСД
+              </Text>
+              <Text style={{ color: '#D0D5DD', textAlign: 'center', marginBottom: 16 }}>
+                Наведите сканер на ШК / QR и нажмите боковую кнопку сканирования.
+                {hwScanner.available ? '' : '\nСканер ТСД должен быть в режиме клавиатуры.'}
+              </Text>
+              <Button title="Включить камеру" onPress={() => setUseCamera(true)} />
+            </View>
+          ) : perm?.granted ? (
             <CameraView
               style={StyleSheet.absoluteFill}
               facing="back"
@@ -152,8 +182,8 @@ export function Scanner({
               <Button title="Разрешить камеру" onPress={requestPerm} />
             </View>
           )}
-          {perm?.granted ? <View pointerEvents="none" style={[st.frame, inView ? null : { borderColor: '#FFFFFFAA' }]} /> : null}
-          {perm?.granted ? (
+          {useCamera && perm?.granted ? <View pointerEvents="none" style={[st.frame, inView ? null : { borderColor: '#FFFFFFAA' }]} /> : null}
+          {useCamera && perm?.granted ? (
             <View pointerEvents="none" style={st.inView}>
               <Text style={{ color: '#fff', textAlign: 'center', fontSize: 15 }}>
                 {inView ? `В кадре: ${inView}` : 'Наведите камеру на ШК / QR'}
@@ -168,7 +198,7 @@ export function Scanner({
               <Text style={[st.bannerText, { color: TONE[message.tone].fg }]}>{message.text}</Text>
             </View>
           ) : message ? <Text style={[st.msg, message.ok && { color: '#86EFAC' }]}>{message.text}</Text> : null}
-          {perm?.granted ? (
+          {useCamera && perm?.granted ? (
             <Pressable onPress={pressScan}
               style={({ pressed }) => [st.scanBtn, !inView && { backgroundColor: '#15803D99' }, pressed && { opacity: 0.75 }]}>
               <Text style={st.scanText}>СКАН</Text>
@@ -177,6 +207,8 @@ export function Scanner({
           <View style={{ flexDirection: 'row', gap: 8 }}>
             <TextInput
               ref={inputRef}
+              autoFocus={!useCamera}
+              showSoftInputOnFocus={softKb}
               blurOnSubmit={false}
               value={manual}
               onChangeText={setManual}
@@ -191,6 +223,13 @@ export function Scanner({
               }}
               style={st.input}
             />
+            {hwScanner.isTerminal ? (
+              <Button title="⌨" variant="secondary" onPress={() => {
+                setSoftKb((v) => !v);
+                inputRef.current?.blur();
+                setTimeout(() => inputRef.current?.focus(), 80);
+              }} />
+            ) : null}
             <Button
               title="OK"
               onPress={() => {
