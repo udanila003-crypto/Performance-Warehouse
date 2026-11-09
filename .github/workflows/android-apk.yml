@@ -40,6 +40,13 @@ jobs:
       - run: npm ci
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install
+      - name: Download Gradle (retries)
+        working-directory: android
+        run: |
+          # services.gradle.org периодически отвечает 504 / не укладывается в 10 с — даём минуту и 5 попыток
+          sed -i 's/^networkTimeout=.*/networkTimeout=60000/' gradle/wrapper/gradle-wrapper.properties
+          for i in 1 2 3 4 5; do ./gradlew --version --no-daemon -q && exit 0; echo "попытка $i не удалась"; sleep $((i * 15)); done
+          exit 1
       - name: Build release APK
         working-directory: android
         run: |
@@ -71,6 +78,13 @@ jobs:
       - run: npm ci
       - name: Generate native Android project (Lite)
         run: npx expo prebuild --platform android --no-install
+      - name: Download Gradle (retries)
+        working-directory: android
+        run: |
+          # services.gradle.org периодически отвечает 504 / не укладывается в 10 с — даём минуту и 5 попыток
+          sed -i 's/^networkTimeout=.*/networkTimeout=60000/' gradle/wrapper/gradle-wrapper.properties
+          for i in 1 2 3 4 5; do ./gradlew --version --no-daemon -q && exit 0; echo "попытка $i не удалась"; sleep $((i * 15)); done
+          exit 1
       - name: Build release APK (Lite)
         working-directory: android
         run: |
